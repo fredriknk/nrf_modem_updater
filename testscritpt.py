@@ -2,14 +2,16 @@ from rtt_terminal import rtt_terminal
 import time
 
 results = []
-command = "AT+CGMR"  # Example command to send
-def collect(line: str) -> None:
-    results.append(line)           # stash each line for later
+commands = ["AT+CGMR","AT+CGMM"]
 
-with rtt_terminal(on_line=collect) as term:
-    print(f"Connected to RTT terminal, sending command:{command}")
-    term.send(command)
-    print("Waiting for response...")
-    time.sleep(1)                  # wait for the modem to answer
+def collect(line: str) -> None:
+    results.append(line)
+
+with rtt_terminal(on_line=collect) as term:  # attach_console auto-disabled
+    print(f"Connected — sending: {commands}")
+    for cmd in commands:
+        print(f"Sending command: {cmd}")
+        term.send(cmd)  # send first command
+        time.sleep(0.5)
 
 print("Got:", results)

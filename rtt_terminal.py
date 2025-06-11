@@ -2,21 +2,18 @@
 """
 Modular RTT terminal for the Nordic nRF9160.
 
-Features
---------
-* **CLI mode** – run this file directly to get an interactive terminal.
-* **Library mode** – import ``RttTerminal`` or use the ``rtt_terminal``
-  context‑manager from another script.
-
-Design goals
-------------
-* No global state – each ``RttTerminal`` owns its own *pyOCD* session.
-* Thread‑safe send/receive helpers.
-* Clean start/stop lifecycle that can be reused.
+Highlights
+==========
+* **CLI mode** – run this file directly to get the classic interactive terminal.
+* **Library mode** – import the module and drive it from your own code.
+* **Synchronous helper** – `query()` sends a line and **returns** its reply.
+* **Smart stdin** – the console‑reader thread is started **only** when the
+  process is attached to a TTY, so head‑less scripts never hang on exit.
 """
 
 from __future__ import annotations
 
+import queue
 import sys
 import threading
 import time
@@ -31,59 +28,92 @@ CHUNK = 1024           # write() tries this many bytes at once
 
 
 class RttTerminal:
-    """High‑level wrapper around SEGGER RTT channels for line‑oriented traffic."""
+    """High‑level wrapper around SEGGER RTT channels.
+
+    Parameters
+    ----------
+    target_override
+        pyOCD target name (default ``"nrf91"``).
+    on_line
+        Callback executed for every ``\n``‑terminated line arriving *from* the
+        target.  Defaults to :pyfunc:`print`.
+    attach_console
+        *True*   spawn a background thread that reads *stdin* and forwards
+        lines to the target (CLI behaviour).
+        *False*  suppress the thread (for scripts!).
+        *None*   **auto:** enabled only when :pydata:`sys.stdin.isatty()` is
+        *True*.
+    """
 
     def __init__(
         self,
         target_override: str = "nrf91",
         *,
         on_line: Optional[Callable[[str], None]] = None,
-        attach_console: bool = True,
+        attach_console: Optional[bool] = None,
     ) -> None:
-        """Create a new terminal.
-
-        Parameters
-        ----------
-        target_override
-            ``pyOCD`` target name passed to *ConnectHelper*.
-        on_line
-            Callback invoked for each *\n*‑terminated line coming from the
-            target (after UTF‑8 decoding).  If *None*, lines are printed to
-            *stdout*.
-        attach_console
-            When *True*, the instance also starts a writer thread that reads
-            lines from *stdin* and sends them to the target – replicating the
-            behaviour of the original script.  Set to *False* if you only need
-            an API and will push data via :pymeth:`send` yourself.
-        """
         self._target_override = target_override
-        self._on_line = on_line if on_line is not None else print
-        self._attach_console = attach_console
+        self._on_line = on_line or print
+        # auto‑detect interactive use when not explicitly set            ↓↓↓
+        self._attach_console = attach_console if attach_console is not None else sys.stdin.isatty()
 
         self._session = None
         self._stop_evt = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._down = None  # type: ignore
-        self._up = None    # type: ignore
+        self._down = None  # RTT down channel (type: pyocd.debug.rtt.RTTDownChannel)
+        self._up = None    # RTT up channel   (type: pyocd.debug.rtt.RTTUpChannel)
 
-    # ---------------------------------------------------------------------
+        # queue that mirrors every incoming line so synchronous helpers can
+        # retrieve replies in FIFO order without blocking the user callback
+        self._rx_q: "queue.Queue[str]" = queue.Queue()
+
+    # ------------------------------------------------------------------
     # Public helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    def send(self, line: str) -> None:
-        """Enqueue *line* to the target, appending the host EOM sentinel."""
+    def send(self, line: str) -> int:
+        """Transmit *line* and return **bytes written** (incl. sentinel)."""
         if not self._down:
             raise RuntimeError("Terminal not started")
 
         payload = line.encode() + EOM
+        sent = 0
         for i in range(0, len(payload), CHUNK):
-            self._down.write(payload[i : i + CHUNK], blocking=True)
+            part = payload[i : i + CHUNK]
+            self._down.write(part, blocking=True)
+            sent += len(part)
+        return sent
+
+    def query(self, line: str, *, timeout: float = 2.0) -> list[str]:
+        """Blocking *ask→reply* helper.
+
+        Sends *line* and waits until at least **one** reply line arrives or the
+        *timeout* elapses.  Returns the list of lines (may be empty).
+        """
+        # Drain any leftover lines from a previous call
+        while not self._rx_q.empty():
+            try:
+                self._rx_q.get_nowait()
+            except queue.Empty:
+                break
+
+        self.send(line)
+        replies: list[str] = []
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            try:
+                remaining = deadline - time.monotonic()
+                replies.append(self._rx_q.get(timeout=max(0.0, remaining)))
+            except queue.Empty:
+                break  # nothing new – done
+        return replies
 
     def stop(self) -> None:
-        """Request shutdown and wait for all background threads."""
+        """Signal shutdown and wait **briefly** for worker threads."""
         self._stop_evt.set()
         for t in self._threads:
-            t.join()
+            t.join(timeout=0.5)  # don’t hang forever
         self._threads.clear()
 
     # ------------------------------------------------------------------
@@ -96,15 +126,14 @@ class RttTerminal:
 
     def __exit__(self, exc_type, exc, tb):
         self.stop()
-        # Don’t suppress exceptions
-        return False
+        return False  # propagate exceptions
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Open the debug session, attach RTT, and start worker threads."""
+        """Open the debug session, attach RTT, and start workers."""
         if self._session is not None:
             raise RuntimeError("Terminal already started")
 
@@ -127,20 +156,28 @@ class RttTerminal:
         self._down = rtt.down_channels[0]
         self._up = rtt.up_channels[1]
 
-        # Purge leftovers
+        # Purge any garbage from previous sessions
         leftover = self._up.read()
         while leftover:
             leftover = self._up.read()
 
+        # --------------------------------------------------------------
+        # Start worker threads
+        # --------------------------------------------------------------
+
         if self._attach_console:
             t_writer = threading.Thread(
-                target=self._stdin_writer, name="stdin-writer", daemon=True
+                target=self._stdin_writer,
+                name="stdin-writer",
+                daemon=True,
             )
             self._threads.append(t_writer)
             t_writer.start()
 
         t_reader = threading.Thread(
-            target=self._rtt_reader, name="rtt-reader", daemon=True
+            target=self._rtt_reader,
+            name="rtt-reader",
+            daemon=True,
         )
         self._threads.append(t_reader)
         t_reader.start()
@@ -150,7 +187,7 @@ class RttTerminal:
     # ------------------------------------------------------------------
 
     def _stdin_writer(self) -> None:
-        """Mirror console lines to the RTT down channel."""
+        """Mirror console lines to RTT (interactive CLI mode)."""
         try:
             while not self._stop_evt.is_set():
                 try:
@@ -168,7 +205,7 @@ class RttTerminal:
             self._stop_evt.set()
 
     def _rtt_reader(self) -> None:
-        """Pump data from the target to the configured handler."""
+        """Pump data from the target to *on_line* and the internal queue."""
         buf = bytearray()
         while not self._stop_evt.is_set():
             data = self._up.read() if self._up else None
@@ -176,7 +213,9 @@ class RttTerminal:
                 buf.extend(data)
                 while b"\n" in buf:
                     line, _, rest = buf.partition(b"\n")
-                    self._on_line(line.decode(errors="replace"))
+                    text = line.decode(errors="replace")
+                    self._rx_q.put(text)       # for query()
+                    self._on_line(text)        # user callback
                     buf = bytearray(rest)
             else:
                 time.sleep(0.01)
@@ -188,14 +227,12 @@ class RttTerminal:
 
 @contextmanager
 def rtt_terminal(*args, **kwargs):
-    """Context‑manager variant for one‑shot scripts.
+    """Sugar for one‑shot scripts.
 
     Example
     -------
-    >>> from rtt_terminal import rtt_terminal
-    >>> with rtt_terminal(on_line=lambda l: print(f"DEV: {l}")) as term:
+    >>> with rtt_terminal() as term:
     ...     term.send("AT+CFUN=1")
-    ...     time.sleep(2)
     """
     term = RttTerminal(*args, **kwargs)
     try:
@@ -210,7 +247,7 @@ def rtt_terminal(*args, **kwargs):
 # ---------------------------------------------------------------------------
 
 def run_cli() -> None:
-    """Replica of the original interactive terminal."""
+    """Interactive terminal, identical to the original script."""
     term = RttTerminal()
     try:
         term.start()
