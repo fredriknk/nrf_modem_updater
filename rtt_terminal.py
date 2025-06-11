@@ -2,13 +2,16 @@
 """
 Modular RTT terminal for the Nordic nRF9160.
 
-Highlights
-==========
-* **CLI mode** – run this file directly to get the classic interactive terminal.
-* **Library mode** – import the module and drive it from your own code.
-* **Synchronous helper** – `query()` sends a line and **returns** its reply.
-* **Smart stdin** – console‑reader thread starts only when `stdin` is a TTY, so
-  head‑less scripts (pytest, CI, …) never hang.
+Key features
+============
+* **CLI mode** – run the file directly for an interactive shell.
+* **Library mode** – import and script via :class:`RttTerminal`.
+* **Flexible `query()`** – now supports a custom *terminator* predicate so you
+  can block until *"OK"*, *"ERROR"*, or any bespoke sentinel.
+* **AT helpers** – :pymeth:`at_query` and :pymeth:`batch_at_query` return
+  structured dicts that pair each command with its payload and status.
+* **Graceful shutdown** – `stop()` is idempotent and closes the pyOCD session
+  so no background threads linger.
 """
 
 from __future__ import annotations
@@ -18,13 +21,15 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from pyocd.core.helpers import ConnectHelper
 from pyocd.debug.rtt import RTTControlBlock  # adjust import if needed
 
 EOM = b"\r\n.\r\n"  # host → device sentinel
-CHUNK = 1024            # write() tries this many bytes at once
+CHUNK = 1024           # write() tries this many bytes at once
+
+AT_TERMINATORS = {"OK", "ERROR"}
 
 
 class RttTerminal:
@@ -43,7 +48,6 @@ class RttTerminal:
     ) -> None:
         self._target_override = target_override
         self._on_line = on_line or print
-        # auto‑detect interactive use when not explicitly set
         self._attach_console = (
             attach_console if attach_console is not None else sys.stdin.isatty()
         )
@@ -54,7 +58,7 @@ class RttTerminal:
         self._down = None  # type: ignore[list‑assignment]
         self._up = None    # type: ignore[list‑assignment]
 
-        # queue that mirrors every incoming line so synchronous helpers can
+        # Queue that mirrors every incoming line so synchronous helpers can
         # retrieve replies without blocking the user callback
         self._rx_q: "queue.Queue[str]" = queue.Queue()
 
@@ -75,13 +79,32 @@ class RttTerminal:
             sent += len(part)
         return sent
 
-    def query(self, line: str, *, timeout: float = 2.0) -> list[str]:
-        """Blocking *ask→reply* helper.
+    # ..................................................................
+    # Generic synchronous query
+    # ..................................................................
 
-        Sends *line* and waits until at least **one** reply line arrives or the
-        *timeout* elapses.  Returns the list of reply lines (may be empty).
+    def query(
+        self,
+        line: str,
+        *,
+        timeout: float = 2.0,
+        until: Optional[Callable[[str], bool]] = None,
+    ) -> list[str]:
+        """Blocking helper that returns all lines until *timeout* or *until*.
+
+        Parameters
+        ----------
+        line
+            Command to send (without ``\n``).
+        timeout
+            Maximum seconds to wait.
+        until
+            Optional predicate ``f(str) -> bool``. Collects lines until the
+            predicate returns *True* **on that line** (included in result), or
+            until the timeout elapses.  If *None*, returns whatever arrived
+            before the deadline.
         """
-        # Drain any leftover lines from a previous call
+        # Drain leftovers from a previous call
         while not self._rx_q.empty():
             try:
                 self._rx_q.get_nowait()
@@ -93,22 +116,65 @@ class RttTerminal:
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
             try:
-                remaining = deadline - time.monotonic()
-                replies.append(self._rx_q.get(timeout=max(0.0, remaining)))
+                line_rx = self._rx_q.get(timeout=max(0.0, remaining))
             except queue.Empty:
+                break  # timeout
+
+            replies.append(line_rx)
+            if until and until(line_rx):
                 break
         return replies
 
-    def stop(self) -> None:
-        """Clean shutdown (idempotent).
+    # ..................................................................
+    # AT‑specific helpers
+    # ..................................................................
 
-        * Raises the stop‑event so worker threads exit.
-        * Joins them briefly so Python can terminate without lingering threads.
-        * Closes the pyOCD session to kill its internal polling thread.
+    def at_query(self, cmd: str, *, timeout: float = 2.0) -> dict[str, str | None]:
+        """Send one AT command and parse its *payload* vs. *status*.
+
+        Returns
+        -------
+        dict
+            ``{"reply": <str>, "status": "OK"|"ERROR"|None}``
         """
+        lines = self.query(cmd, timeout=timeout, until=lambda l: l.strip() in AT_TERMINATORS)
+
+        status = None
+        payload_lines: list[str] = []
+        for l in lines:
+            ls = l.strip()
+            if ls in AT_TERMINATORS and status is None:
+                status = ls
+            else:
+                payload_lines.append(ls)
+
+        return {"reply": "\n".join(payload_lines), "status": status}
+
+    def batch_at_query(
+        self,
+        commands: Iterable[str],
+        *,
+        timeout: float = 2.0,
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> dict[str, dict[str, str | None]]:
+        """Run several AT commands **sequentially** and map each to its answer."""
+        result: dict[str, dict[str, str | None]] = {}
+        for cmd in commands:
+            if progress:
+                progress(cmd)
+            result[cmd] = self.at_query(cmd, timeout=timeout)
+        return result
+
+    # ..................................................................
+    # Shutdown + context manager
+    # ..................................................................
+
+    def stop(self) -> None:
+        """Clean shutdown (idempotent)."""
         if self._stop_evt.is_set():
-            return  # already stopped
+            return
 
         self._stop_evt.set()
         for t in self._threads:
@@ -121,25 +187,20 @@ class RttTerminal:
             finally:
                 self._session = None
 
-    # ------------------------------------------------------------------
-    # Context‑manager helpers
-    # ------------------------------------------------------------------
-
     def __enter__(self):
         self.start()
         return self
 
     def __exit__(self, exc_type, exc, tb):
         self.stop()
-        # propagate exception if any
-        return False
+        return False  # propagate
 
     # ------------------------------------------------------------------
-    # Lifecycle
+    # Internal lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Open the debug session, attach RTT, and start worker threads."""
+        """Open debug session, attach RTT, spin workers."""
         if self._session is not None:
             raise RuntimeError("Terminal already started")
 
@@ -162,38 +223,27 @@ class RttTerminal:
         self._down = rtt.down_channels[0]
         self._up = rtt.up_channels[1]
 
-        # Purge any garbage from previous sessions
+        # Purge leftover bytes
         leftover = self._up.read()
         while leftover:
             leftover = self._up.read()
 
-        # --------------------------------------------------------------
-        # Start worker threads
-        # --------------------------------------------------------------
-
-        if self._attach_console:
-            t_writer = threading.Thread(
-                target=self._stdin_writer,
-                name="stdin-writer",
-                daemon=True,
-            )
-            self._threads.append(t_writer)
-            t_writer.start()
-
-        t_reader = threading.Thread(
-            target=self._rtt_reader,
-            name="rtt-reader",
-            daemon=True,
-        )
+        # start reader
+        t_reader = threading.Thread(target=self._rtt_reader, name="rtt-reader", daemon=True)
         self._threads.append(t_reader)
         t_reader.start()
+
+        # optional stdin mirror
+        if self._attach_console:
+            t_writer = threading.Thread(target=self._stdin_writer, name="stdin-writer", daemon=True)
+            self._threads.append(t_writer)
+            t_writer.start()
 
     # ------------------------------------------------------------------
     # Worker threads (private)
     # ------------------------------------------------------------------
 
     def _stdin_writer(self) -> None:
-        """Mirror console lines to RTT (interactive CLI mode)."""
         try:
             while not self._stop_evt.is_set():
                 try:
@@ -211,7 +261,6 @@ class RttTerminal:
             self._stop_evt.set()
 
     def _rtt_reader(self) -> None:
-        """Pump data from the target to *on_line* and the internal queue."""
         buf = bytearray()
         while not self._stop_evt.is_set():
             data = self._up.read() if self._up else None
@@ -228,7 +277,7 @@ class RttTerminal:
 
 
 # ---------------------------------------------------------------------------
-# Convenience context‑manager
+# Convenience context manager
 # ---------------------------------------------------------------------------
 
 @contextmanager
@@ -247,7 +296,6 @@ def rtt_terminal(*args, **kwargs):
 # ---------------------------------------------------------------------------
 
 def run_cli() -> None:
-    """Interactive terminal, identical to the original script."""
     term = RttTerminal()
     try:
         term.start()
@@ -260,7 +308,7 @@ def run_cli() -> None:
         print("Bye.")
 
 
-def main() -> None:  # kept for backward compatibility
+def main() -> None:  # Back‑compat
     run_cli()
 
 
