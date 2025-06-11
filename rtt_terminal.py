@@ -7,8 +7,8 @@ Highlights
 * **CLI mode** – run this file directly to get the classic interactive terminal.
 * **Library mode** – import the module and drive it from your own code.
 * **Synchronous helper** – `query()` sends a line and **returns** its reply.
-* **Smart stdin** – the console‑reader thread is started **only** when the
-  process is attached to a TTY, so head‑less scripts never hang on exit.
+* **Smart stdin** – console‑reader thread starts only when `stdin` is a TTY, so
+  head‑less scripts (pytest, CI, …) never hang.
 """
 
 from __future__ import annotations
@@ -24,26 +24,15 @@ from pyocd.core.helpers import ConnectHelper
 from pyocd.debug.rtt import RTTControlBlock  # adjust import if needed
 
 EOM = b"\r\n.\r\n"  # host → device sentinel
-CHUNK = 1024           # write() tries this many bytes at once
+CHUNK = 1024            # write() tries this many bytes at once
 
 
 class RttTerminal:
-    """High‑level wrapper around SEGGER RTT channels.
+    """High‑level wrapper around SEGGER RTT channels."""
 
-    Parameters
-    ----------
-    target_override
-        pyOCD target name (default ``"nrf91"``).
-    on_line
-        Callback executed for every ``\n``‑terminated line arriving *from* the
-        target.  Defaults to :pyfunc:`print`.
-    attach_console
-        *True*   spawn a background thread that reads *stdin* and forwards
-        lines to the target (CLI behaviour).
-        *False*  suppress the thread (for scripts!).
-        *None*   **auto:** enabled only when :pydata:`sys.stdin.isatty()` is
-        *True*.
-    """
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
 
     def __init__(
         self,
@@ -54,17 +43,19 @@ class RttTerminal:
     ) -> None:
         self._target_override = target_override
         self._on_line = on_line or print
-        # auto‑detect interactive use when not explicitly set            ↓↓↓
-        self._attach_console = attach_console if attach_console is not None else sys.stdin.isatty()
+        # auto‑detect interactive use when not explicitly set
+        self._attach_console = (
+            attach_console if attach_console is not None else sys.stdin.isatty()
+        )
 
         self._session = None
         self._stop_evt = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._down = None  # RTT down channel (type: pyocd.debug.rtt.RTTDownChannel)
-        self._up = None    # RTT up channel   (type: pyocd.debug.rtt.RTTUpChannel)
+        self._down = None  # type: ignore[list‑assignment]
+        self._up = None    # type: ignore[list‑assignment]
 
         # queue that mirrors every incoming line so synchronous helpers can
-        # retrieve replies in FIFO order without blocking the user callback
+        # retrieve replies without blocking the user callback
         self._rx_q: "queue.Queue[str]" = queue.Queue()
 
     # ------------------------------------------------------------------
@@ -88,7 +79,7 @@ class RttTerminal:
         """Blocking *ask→reply* helper.
 
         Sends *line* and waits until at least **one** reply line arrives or the
-        *timeout* elapses.  Returns the list of lines (may be empty).
+        *timeout* elapses.  Returns the list of reply lines (may be empty).
         """
         # Drain any leftover lines from a previous call
         while not self._rx_q.empty():
@@ -106,15 +97,29 @@ class RttTerminal:
                 remaining = deadline - time.monotonic()
                 replies.append(self._rx_q.get(timeout=max(0.0, remaining)))
             except queue.Empty:
-                break  # nothing new – done
+                break
         return replies
 
     def stop(self) -> None:
-        """Signal shutdown and wait **briefly** for worker threads."""
+        """Clean shutdown (idempotent).
+
+        * Raises the stop‑event so worker threads exit.
+        * Joins them briefly so Python can terminate without lingering threads.
+        * Closes the pyOCD session to kill its internal polling thread.
+        """
+        if self._stop_evt.is_set():
+            return  # already stopped
+
         self._stop_evt.set()
         for t in self._threads:
-            t.join(timeout=0.5)  # don’t hang forever
+            t.join(timeout=0.5)
         self._threads.clear()
+
+        if self._session is not None:
+            try:
+                self._session.close()
+            finally:
+                self._session = None
 
     # ------------------------------------------------------------------
     # Context‑manager helpers
@@ -126,14 +131,15 @@ class RttTerminal:
 
     def __exit__(self, exc_type, exc, tb):
         self.stop()
-        return False  # propagate exceptions
+        # propagate exception if any
+        return False
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Open the debug session, attach RTT, and start workers."""
+        """Open the debug session, attach RTT, and start worker threads."""
         if self._session is not None:
             raise RuntimeError("Terminal already started")
 
@@ -214,8 +220,8 @@ class RttTerminal:
                 while b"\n" in buf:
                     line, _, rest = buf.partition(b"\n")
                     text = line.decode(errors="replace")
-                    self._rx_q.put(text)       # for query()
-                    self._on_line(text)        # user callback
+                    self._rx_q.put(text)
+                    self._on_line(text)
                     buf = bytearray(rest)
             else:
                 time.sleep(0.01)
@@ -227,13 +233,7 @@ class RttTerminal:
 
 @contextmanager
 def rtt_terminal(*args, **kwargs):
-    """Sugar for one‑shot scripts.
-
-    Example
-    -------
-    >>> with rtt_terminal() as term:
-    ...     term.send("AT+CFUN=1")
-    """
+    """Sugar for one‑shot scripts."""
     term = RttTerminal(*args, **kwargs)
     try:
         term.start()
