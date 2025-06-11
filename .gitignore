@@ -1,0 +1,15 @@
+.env
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Ignore everything in certs and fw folders
+certs/*
+fw/*
+
+# But keep .gitkeep files
+!certs/.gitkeep
+!fw/.gitkeep
