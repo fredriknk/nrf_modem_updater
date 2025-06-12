@@ -1,25 +1,20 @@
-"""AT command batch result parser
+"""
+at_parser.py – turn batch_at_query() results into a colour-coded PASS/FAIL
+report, with optional per-test limits you control at runtime.
 
-This module turns the raw dict you get back from `RttTerminal.batch_at_query()`
-into a readable PASS/FAIL console report.  It focuses on the commands you
-listed, but is easy to extend – just add a new entry to `PARSERS`.
-
-Usage example
--------------
-```python
+Example
+-------
 from at_parser import generate_report
-report = term.batch_at_query(...)
-print(generate_report(report))
-```
-The printed report looks like:
-```
-PASS  Modem functional            (no reply)
-FAIL  Network registration        searching
-PASS  Battery voltage             5.05 V
-PASS  Modem temperature           25 °C
-PASS  Network monitor             registered, LTE band 20, RSRP -87 dBm
-```
-PASS/FAIL is colour‑coded (green/red) when ANSI escape sequences are supported.
+
+raw = term.batch_at_query(at_commands)
+
+limits = {
+    "Battery voltage": {"min": 3600, "max": 4500},      # mV
+    "Modem temperature": {"max": 70},                   # °C
+    "Network monitor": {"field": "rsrp_dbm", "min": -105},
+}
+
+print(generate_report(raw, limits))
 """
 from __future__ import annotations
 
@@ -28,27 +23,19 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple
 
-# ────────────────────────────────────────────────────────────
-# Console colours
-# ────────────────────────────────────────────────────────────
-GREEN = "\033[92m"
-RED = "\033[91m"
-RESET = "\033[0m"
+# ────────────────────────── ANSI helpers ──────────────────────────
+GREEN, RED, RESET = "\033[92m", "\033[91m", "\033[0m"
 
 
-def _color(text: str, ok: bool, highlight: bool) -> str:  # internal helper
-    if not highlight:
-        return text
-    return f"{GREEN if ok else RED}{text}{RESET}"
+def _color(txt: str, ok: bool, hilite: bool) -> str:
+    return f"{GREEN if ok else RED}{txt}{RESET}" if hilite else txt
 
 
-# ────────────────────────────────────────────────────────────
-# Result container
-# ────────────────────────────────────────────────────────────
+# ────────────────────────── data containers ──────────────────────
 @dataclass
 class Parsed:
-    value: Any               # machine‑readable value (int, dict, str…)
-    description: str         # human‑readable summary
+    value: Any
+    description: str
 
 
 @dataclass
@@ -60,28 +47,49 @@ class TestResult:
     passed: bool
 
     def line(self, highlight: bool = True) -> str:
-        status_txt = "PASS" if self.passed else "FAIL"
-        status_txt = _color(status_txt, self.passed, highlight)
+        tag = _color("PASS" if self.passed else "FAIL", self.passed, highlight)
         desc = self.parsed.description if self.parsed else "(no details)"
-        return f"{status_txt:5}  {self.name:<25}  {desc}"
+        return f"{tag:5}  {self.name:<25}  {desc}"
 
 
-# ────────────────────────────────────────────────────────────
-# Per‑command parser helpers
-# ────────────────────────────────────────────────────────────
+# ────────────────────────── limit overrides ──────────────────────
+def _apply_override(
+    name: str, val: Any, default_pass: bool, limits: Dict[str, dict] | None
+) -> bool:
+    if not limits or name not in limits:
+        return default_pass
 
-def _pass_if_ok(reply: str, status: str | None) -> Tuple[Parsed | None, bool, str]:
-    passed = (status or "OK") == "OK"
-    return Parsed(reply, reply or "(no reply)"), passed, "Modem functional"
+    rule = limits[name]
+
+    if isinstance(val, dict) and "field" in rule:
+        val = val.get(rule["field"])
+
+    if val is None:
+        return False
+    if "equals" in rule:
+        return val == rule["equals"]
+    if "allowed" in rule:
+        return val in rule["allowed"]
+
+    lo = rule.get("min", float("-inf"))
+    hi = rule.get("max", float("inf"))
+    try:
+        return lo <= val <= hi  # type: ignore[operator]
+    except TypeError:
+        return False
 
 
-def _parse_cereg(reply: str, _status: str | None) -> Tuple[Parsed | None, bool, str]:
-    # +CEREG: <n>,<stat>,...
-    m = re.match(r"\+CEREG: (\d),(\d)", reply)
+# ────────────────────────── individual parsers ───────────────────
+def _pass_if_ok(reply: str, status: str | None) -> Tuple[Parsed, bool]:
+    return Parsed(reply, reply or "(no reply)"), (status or "OK") == "OK"
+
+
+def _parse_cereg(reply: str, _s: str | None) -> Tuple[Parsed, bool]:
+    m = re.match(r"\+CEREG: \d,(\d)", reply)
     if not m:
-        return Parsed(reply, "unparseable"), False, "Network registration"
-    _n, stat = map(int, m.groups())
-    meaning = {
+        return Parsed(reply, "unparseable"), False
+    stat = int(m.group(1))
+    desc = {
         0: "not registered",
         1: "registered – home",
         2: "searching",
@@ -89,269 +97,179 @@ def _parse_cereg(reply: str, _status: str | None) -> Tuple[Parsed | None, bool, 
         4: "unknown",
         5: "registered – roaming",
     }.get(stat, "unknown")
-    passed = stat in (1, 5)
-    return Parsed(stat, meaning), passed, "Network registration"
+    return Parsed(stat, desc), stat in (1, 5)
 
 
-def _simple_value(name: str) -> Callable[[str, str | None], Tuple[Parsed, bool, str]]:
-    def parser(reply: str, status: str | None) -> Tuple[Parsed, bool, str]:
+def _simple_value(_label: str) -> Callable[[str, str | None], Tuple[Parsed, bool]]:
+    def p(reply: str, status: str | None) -> Tuple[Parsed, bool]:
         ok = (status or "OK") == "OK" and bool(reply.strip())
-        return Parsed(reply, reply), ok, name
+        return Parsed(reply, reply), ok
 
-    return parser
+    return p
 
 
-def _parse_xvbat(reply: str, _status: str | None) -> Tuple[Parsed, bool, str]:
+def _parse_xvbat(reply: str, _s: str | None) -> Tuple[Parsed, bool]:
     m = re.match(r"%XVBAT: (\d+)", reply)
     if not m:
-        return Parsed(reply, "unparseable"), False, "Battery voltage"
+        return Parsed(reply, "unparseable"), False
     mv = int(m.group(1))
-    description = f"{mv/1000:.2f} V"
-    passed = 3_300 <= mv <= 5_500
-    return Parsed(mv, description), passed, "Battery voltage"
+    return Parsed(mv, f"{mv/1000:.2f} V"), 3300 <= mv <= 5500
 
 
-def _parse_xtemp(reply: str, _status: str | None) -> Tuple[Parsed, bool, str]:
+def _parse_xtemp(reply: str, _s: str | None) -> Tuple[Parsed, bool]:
     m = re.match(r"%XTEMP: (-?\d+)", reply)
     if not m:
-        return Parsed(reply, "unparseable"), False, "Modem temperature"
-    temp = int(m.group(1))
-    passed = -40 <= temp <= 85  # nRF91 operating range
-    return Parsed(temp, f"{temp} °C"), passed, "Modem temperature"
+        return Parsed(reply, "unparseable"), False
+    t = int(m.group(1))
+    return Parsed(t, f"{t} °C"), -40 <= t <= 85
 
 
-def _parse_xsystemmode(reply: str, _status: str | None) -> Tuple[Parsed, bool, str]:
+def _parse_xsystemmode(reply: str, _s: str | None) -> Tuple[Parsed, bool]:
     m = re.match(r"%XSYSTEMMODE: (\d),(\d),(\d),(\d)", reply)
     if not m:
-        return Parsed(reply, "unparseable"), False, "System mode"
-    lte_m, nb_iot, gnss, pref = map(int, m.groups())
-    modes: List[str] = []
-    if lte_m:
-        modes.append("LTE‑M")
-    if nb_iot:
-        modes.append("NB‑IoT")
-    if gnss:
-        modes.append("GNSS")
-    description = ", ".join(modes) or "(none)"
-    passed = lte_m == 1  # tweak to your needs
-    return Parsed((lte_m, nb_iot, gnss, pref), description), passed, "System mode"
+        return Parsed(reply, "unparseable"), False
+    lte, nbiot, gnss, pref = map(int, m.groups())
+    modes = [n for b, n in ((lte, "LTE-M"), (nbiot, "NB-IoT"), (gnss, "GNSS")) if b]
+    return Parsed((lte, nbiot, gnss, pref), ", ".join(modes) or "(none)"), lte == 1
 
 
-# ────────────────────────────────────────────────────────────
-# NEW: full parser for %XMONITOR
-# ────────────────────────────────────────────────────────────
-
-def _parse_xmonitor(reply: str, _status: str | None) -> Tuple[Parsed, bool, str]:
-    """Parse Nordic *%XMONITOR* readout.
-
-    Example input (single line)::
-        %XMONITOR: 1,"","","24201","81AE",7,20,"0331C805",281,6400,53,42,"","00100001","00000110","01011111"
-
-    Returns a *Parsed* object whose *value* is a dict with the individual
-    fields; *description* is a concise summary; PASS if registered (stat 1 or
-    5) **and** RSRP stronger than ‑110 dBm.
-    """
-    # Strip prefix and feed to CSV so quoted commas are handled correctly
-    prefix = "%XMONITOR: "
-    if not reply.startswith(prefix):
-        return Parsed(reply, "unparseable"), False, "Network monitor"
-
-    csv_part = reply[len(prefix):].strip()
-    try:
-        fields = next(csv.reader([csv_part]))
-    except Exception:
-        return Parsed(reply, "unparseable"), False, "Network monitor"
-
-    # Pad missing trailing fields with ""
-    while len(fields) < 16:
-        fields.append("")
-
+def _parse_xmonitor(reply: str, _s: str | None) -> Tuple[Parsed, bool]:
+    if not reply.startswith("%XMONITOR: "):
+        return Parsed(reply, "unparseable"), False
+    row = next(csv.reader([reply[len("%XMONITOR: ") :]]))
+    row += [""] * (16 - len(row))  # pad
     (
-        reg_status,
-        full_name,
-        short_name,
+        reg,
+        _f,
+        _s,
         plmn,
         tac,
         act,
         band,
-        cell_id,
-        phys_cell_id,
+        cid,
+        pcid,
         earfcn,
-        rsrp_idx,
-        snr_idx,
-        *rest,
-    ) = fields  # type: ignore[misc]
+        rsrp_i,
+        snr_i,
+        *_,
+    ) = row
 
-    # Convert numeric strings when present
-    def _to_int(s: str) -> int | None:
-        return int(s) if s and s.isdigit() else None
+    to_int = lambda x: int(x) if x.isdigit() else None
+    reg_i, band_i = to_int(reg) or -1, to_int(band)
+    rsrp_dbm = (to_int(rsrp_i) - 140) if to_int(rsrp_i) is not None else None
+    snr_db = (to_int(snr_i) / 10.0) if to_int(snr_i) is not None else None
 
-    reg_status_i = _to_int(reg_status) or -1
-    band_i = _to_int(band)
-    rsrp_i = _to_int(rsrp_idx)
-    snr_i = _to_int(snr_idx)
-
-    # Decode registration status to text
-    status_meaning = {
+    status = {
         0: "not registered",
         1: "registered – home",
         2: "searching",
         3: "denied",
         4: "unknown",
         5: "registered – roaming",
-    }.get(reg_status_i, "unknown")
+    }.get(reg_i, "unknown")
 
-    # Convert RSRP index → dBm per 3GPP TS 36.133 §9.1.4
-    rsrp_dbm: int | None = None
-    if rsrp_i is not None:
-        rsrp_dbm = rsrp_i - 140  # index 0 == -140 dBm, 97 == -43 dBm
-
-    # Convert SNR index (0.1 dB units) → dB
-    snr_db: float | None = None
-    if snr_i is not None:
-        snr_db = snr_i / 10.0
-
-    summary_parts: List[str] = [status_meaning]
+    parts = [status]
     if band_i is not None:
-        summary_parts.append(f"LTE band {band_i}")
+        parts.append(f"LTE band {band_i}")
     if rsrp_dbm is not None:
-        summary_parts.append(f"RSRP {rsrp_dbm} dBm")
+        parts.append(f"RSRP {rsrp_dbm} dBm")
     if snr_db is not None:
-        summary_parts.append(f"SNR {snr_db:.1f} dB")
-    description = ", ".join(summary_parts)
+        parts.append(f"SNR {snr_db:.1f} dB")
 
-    passed = reg_status_i in (1, 5) and (rsrp_dbm > -100)
-
-    parsed_value = {
-        "reg_status": reg_status_i,
-        "plmn": plmn.strip('"'),
-        "tac": tac.strip('"'),
-        "act": _to_int(act),
-        "band": band_i,
-        "cell_id": cell_id.strip('"'),
-        "phys_cell_id": _to_int(phys_cell_id),
-        "earfcn": _to_int(earfcn),
-        "rsrp_dbm": rsrp_dbm,
-        "snr_db": snr_db,
-    }
-
-    return Parsed(parsed_value, description), passed, "Network monitor"
+    parsed_val = dict(
+        reg_status=reg_i,
+        plmn=plmn.strip('"'),
+        tac=tac.strip('"'),
+        act=to_int(act),
+        band=band_i,
+        cell_id=cid.strip('"'),
+        phys_cell_id=to_int(pcid),
+        earfcn=to_int(earfcn),
+        rsrp_dbm=rsrp_dbm,
+        snr_db=snr_db,
+    )
+    default_pass = reg_i in (1, 5) and (rsrp_dbm is None or rsrp_dbm > -110)
+    return Parsed(parsed_val, ", ".join(parts)), default_pass
 
 
-# ────────────────────────────────────────────────────────────
-# Registry
-# ────────────────────────────────────────────────────────────
-PARSERS: Dict[str, Callable[[str, str | None], Tuple[Parsed | None, bool, str]]] = {
+# ────────────────────────── registry & names ────────────────────
+PARSERS: Dict[str, Callable[[str, str | None], Tuple[Parsed, bool]]] = {
     "AT+CFUN=1": _pass_if_ok,
+    "AT+CFUN=0": _pass_if_ok,
     "AT+CEREG?": _parse_cereg,
     "AT+CGMI": _simple_value("Manufacturer"),
-    "AT+CGMR": _simple_value("Firmware version"),
+    "AT+CGMR": _simple_value("Firmware"),
     "AT+CGMM": _simple_value("Model"),
     "AT+CGSN": _simple_value("IMEI"),
     "AT+CIMI": _simple_value("IMSI"),
     "AT%XICCID": _simple_value("ICCID"),
-    "AT%XMONITOR": _parse_xmonitor,  # updated!
+    "AT%XMONITOR": _parse_xmonitor,
     "AT%XVBAT": _parse_xvbat,
     "AT%XTEMP?": _parse_xtemp,
     "AT%XSYSTEMMODE?": _parse_xsystemmode,
-    "AT+CFUN=0": _pass_if_ok,
 }
 
+NAMES = {
+    "AT+CFUN=1": "Modem functional",
+    "AT+CFUN=0": "Modem functional",
+    "AT+CEREG?": "Network registration",
+    "AT+CGMI": "Manufacturer",
+    "AT+CGMR": "Firmware version",
+    "AT+CGMM": "Model",
+    "AT+CGSN": "IMEI",
+    "AT+CIMI": "IMSI",
+    "AT%XICCID": "ICCID",
+    "AT%XMONITOR": "Network monitor",
+    "AT%XVBAT": "Battery voltage",
+    "AT%XTEMP?": "Modem temperature",
+    "AT%XSYSTEMMODE?": "System mode",
+}
 
-# ────────────────────────────────────────────────────────────
-# Public API
-# ────────────────────────────────────────────────────────────
-
-def parse(report: Dict[str, Dict[str, str]], highlight: bool = True) -> List[TestResult]:
-    """Return a list of *TestResult* objects."""
-    results: List[TestResult] = []
+# ────────────────────────── public API ──────────────────────────
+def parse(
+    report: Dict[str, Dict[str, str]],
+    limits: Dict[str, dict] | None = None,
+    highlight: bool = True,
+) -> List[TestResult]:
+    out: List[TestResult] = []
     for cmd, info in report.items():
-        reply = info.get("reply", "")
-        status = info.get("status")
-        parser = PARSERS.get(cmd, _default_parser)
-        parsed, passed, name = parser(reply, status)
-        results.append(TestResult(cmd, name, parsed, status, passed))
-    return results
+        reply, status = info.get("reply", ""), info.get("status")
+        parsed, default_pass = PARSERS.get(cmd, _pass_if_ok)(reply, status)
+        final = _apply_override(NAMES.get(cmd, "Command"), parsed.value, default_pass, limits)
+        out.append(TestResult(cmd, NAMES.get(cmd, "Command"), parsed, status, final))
+    return out
 
 
-def generate_report(report: Dict[str, Dict[str, str]], highlight: bool = True) -> str:
-    """Return a multi‑line string with nicely formatted results."""
-    return "\n".join(r.line(highlight) for r in parse(report, highlight))
+def generate_report(
+    report: Dict[str, Dict[str, str]],
+    limits: Dict[str, dict] | None = None,
+    highlight: bool = True,
+) -> str:
+    return "\n".join(r.line(highlight) for r in parse(report, limits, highlight))
 
 
-# ────────────────────────────────────────────────────────────
-# Fallback for unknown commands
-# ────────────────────────────────────────────────────────────
-
-def _default_parser(reply: str, status: str | None) -> Tuple[Parsed | None, bool, str]:
-    passed = (status or "OK") == "OK"
-    return Parsed(reply, reply or "(no reply)"), passed, "Command"
-
-
-
-
-# If executed as a script, run a quick demo with the sample data
-def _demo() -> None:
-    import json, textwrap
-
-    sample = {
-            "AT+CFUN=1": {
-                "reply": "",
-                "status": "OK"
-            },
-            "AT+CEREG?": {
-                "reply": "+CEREG: 0,1,\"81AE\",\"0331C805\",7",
-                "status": "OK"
-            },
-            "AT+CGMI": {
-                "reply": "Nordic Semiconductor ASA",
-                "status": "OK"
-            },
-            "AT+CGMR": {
-                "reply": "mfw_nrf9160_1.3.7",
-                "status": "OK"
-            },
-            "AT+CGMM": {
-                "reply": "nRF9160-SICA",
-                "status": "OK"
-            },
-            "AT+CGSN": {
-                "reply": "350457791624248",
-                "status": "OK"
-            },
-            "AT+CIMI": {
-                "reply": "242016001128485",
-                "status": "OK"
-            },
-            "AT%XICCID": {
-                "reply": "%XICCID: 89470060210108095010",
-                "status": "OK"
-            },
-            "AT%XMONITOR": {
-                "reply": "%XMONITOR: 1,\"\",\"\",\"24201\",\"81AE\",7,20,\"0331C805\",281,6400,53,42,\"\",\"00100001\",\"00000110\",\"01011111\"",
-                "status": "OK"
-            },
-            "AT%XVBAT": {
-                "reply": "%XVBAT: 5046",
-                "status": "OK"
-            },
-            "AT%XTEMP?": {
-                "reply": "%XTEMP: 25",
-                "status": "OK"
-            },
-            "AT%XSYSTEMMODE?": {
-                "reply": "%XSYSTEMMODE: 1,1,1,0",
-                "status": "OK"
-            },
-            "AT+CFUN=0": {
-                "reply": "",
-                "status": "OK"
-            }
-            }
-    print(textwrap.indent(json.dumps(sample, indent=2), "  "))
-    print("\nReport:\n")
-    print(generate_report(sample))
-
-
+# ────────────────────────── CLI demo ────────────────────────────
 if __name__ == "__main__":
-    _demo()
+    demo = {
+        "AT+CFUN=1": {"reply": "", "status": "OK"},
+        "AT+CGMI": {"reply": "Nordic Semiconductor ASA", "status": "OK"},
+        "AT+CGMR": {"reply": "nRF9160 SICA 1.3.7", "status": "OK"},
+        "AT+CEREG?": {"reply": "+CEREG: 0,1,\"81AE\",\"0331C805\",7", "status": "OK"},
+        "AT%XMONITOR": {
+            "reply": "%XMONITOR: 1,\"\",\"\",\"24201\",\"81AE\",7,20,\"0331C805\",281,6400,53,42,\"\",\"\",\"\",\"\"",
+            "status": "OK",
+        },
+        "AT%XVBAT": {"reply": "%XVBAT: 5046", "status": "OK"},
+        "AT%XTEMP?": {"reply": "%XTEMP: 25", "status": "OK"},
+    }
+
+    limits = {
+    "Battery voltage": {"min": 4900, "max": 5100},      # mV
+    "Modem temperature": {"max": 30},                   # °C
+    "Network monitor": {"field": "rsrp_dbm", "min": -80},
+    #"Network monitor": {"field": "snr_db", "min": 4},  # dBm, dB
+    "Network registration": {"equals": 1},  # registered – home
+    "Manufacturer": {"equals": "Nordic Semiconductor ASA"},
+    "Firmware version": {"equals": "nRF9160 SICA 1.3.7"},
+    }
+    print(generate_report(demo,limits=limits, highlight=True))
