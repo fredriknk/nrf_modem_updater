@@ -9,7 +9,7 @@ from at_parser import generate_report
 raw = term.batch_at_query(at_commands)
 
 limits = {
-    "Battery voltage": {"min": 3600, "max": 4500},      # mV
+    "System Voltage": {"min": 3600, "max": 4500},      # mV
     "Modem temperature": {"max": 70},                   # °C
     "Network monitor": {"field": "rsrp_dbm", "min": -105},
 }
@@ -46,10 +46,13 @@ class TestResult:
     parsed: Parsed | None
     status: str | None
     passed: bool
+    reasons: list[str]    
 
     def line(self, highlight: bool = True) -> str:
         tag   = _color("PASS" if self.passed else "FAIL", self.passed, highlight)
         desc  = self.parsed.description if self.parsed else "(no details)"
+        if not self.passed and self.reasons:
+            desc = f"{desc}  [fail: {'; '.join(self.reasons)}]"
         desc  = _color_desc(desc, self.passed, highlight)
         return f"{tag:5}  {self.name:<25}  {desc}"
     # 1. helper: paint only if this field failed
@@ -67,38 +70,54 @@ def _apply_override(
     val: Any,
     default_pass: bool,
     limits: Dict[str, dict | list[dict]] | None,
-) -> bool:
+) -> tuple[bool, list[str]]:
     """
-    Combine default PASS/FAIL with user-supplied *limits*.
-
-    *limits[name]* may be a single rule-dict **or** a list of rule-dicts.
-    All rules must evaluate True for the test to pass (logical AND).
+    Evaluate user limits.
+    Returns (overall_pass, reasons).  reasons = list of strings for rules that failed.
     """
     if not limits or name not in limits:
-        return default_pass
+        return default_pass, []
 
-    rule_set = limits[name]
-    if not isinstance(rule_set, list):
-        rule_set = [rule_set]  # unify
+    rules = limits[name]
+    if not isinstance(rules, list):
+        rules = [rules]
 
-    def one_rule(rule: dict, v: Any) -> bool:
-        # pick sub-field first
-        if isinstance(v, dict) and "field" in rule:
-            v = v.get(rule["field"])
+    reasons: list[str] = []
+
+    def check(rule: dict) -> bool:
+        v = val
+        field = rule.get("field")
+        if isinstance(v, dict) and field:
+            v = v.get(field)
         if v is None:
+            reasons.append(f"{field or 'value'} missing")
             return False
+
         if "equals" in rule:
-            return v == rule["equals"]
+            ok = v == rule["equals"]
+            if not ok:
+                reasons.append(f"{field or 'value'} ≠ {rule['equals']!r} (got {v!r})")
+            return ok
+
         if "allowed" in rule:
-            return v in rule["allowed"]
+            ok = v in rule["allowed"]
+            if not ok:
+                reasons.append(f"{v!r} not in {rule['allowed']}")
+            return ok
+
         lo = rule.get("min", float("-inf"))
         hi = rule.get("max", float("inf"))
         try:
-            return lo <= v <= hi  # type: ignore[operator]
+            ok = lo <= v <= hi  # type: ignore[operator]
         except TypeError:
-            return False
+            ok = False
+        if not ok:
+            bound = "<" if v < lo else ">" if v > hi else "!"
+            reasons.append(f"{field or 'value'} {v} {bound} [{lo}‒{hi}]")
+        return ok
 
-    return all(one_rule(r, val) for r in rule_set)
+    overall = all(check(r) for r in rules)
+    return overall, reasons
 
 
 
@@ -129,7 +148,17 @@ def _simple_value(_label: str) -> Callable[[str, str | None], Tuple[Parsed, bool
         return Parsed(reply, reply), ok
 
     return p
-
+def _simple_value_strip(_label: str) -> Callable[[str, str | None], Tuple[Parsed, bool]]:
+    """
+    Strip the AT prefix (everything up to & incl. the first ‘:’) so the
+    description shows only the payload, e.g.
+        "%XICCID: 8947…"  ->  "8947…"
+    """
+    def p(reply: str, status: str | None) -> Tuple[Parsed, bool]:
+        ok = (status or "OK") == "OK" and bool(reply.strip())
+        value = reply.split(":", 1)[-1].strip()      # keep whole string if no colon
+        return Parsed(value, value), ok
+    return p
 
 def _parse_xvbat(reply: str, _s: str | None) -> Tuple[Parsed, bool]:
     m = re.match(r"%XVBAT: (\d+)", reply)
@@ -224,7 +253,7 @@ PARSERS: Dict[str, Callable[[str, str | None], Tuple[Parsed, bool]]] = {
     "AT+CGMM": _simple_value("Model"),
     "AT+CGSN": _simple_value("IMEI"),
     "AT+CIMI": _simple_value("IMSI"),
-    "AT%XICCID": _simple_value("ICCID"),
+    "AT%XICCID": _simple_value_strip("ICCID"),
     "AT%XMONITOR": _parse_xmonitor,
     "AT%XVBAT": _parse_xvbat,
     "AT%XTEMP?": _parse_xtemp,
@@ -242,7 +271,7 @@ NAMES = {
     "AT+CIMI": "IMSI",
     "AT%XICCID": "ICCID",
     "AT%XMONITOR": "Network monitor",
-    "AT%XVBAT": "Battery voltage",
+    "AT%XVBAT": "System Voltage",
     "AT%XTEMP?": "Modem temperature",
     "AT%XSYSTEMMODE?": "System mode",
 }
@@ -257,8 +286,8 @@ def parse(
     for cmd, info in report.items():
         reply, status = info.get("reply", ""), info.get("status")
         parsed, default_pass = PARSERS.get(cmd, _pass_if_ok)(reply, status)
-        final = _apply_override(NAMES.get(cmd, "Command"), parsed.value, default_pass, limits)
-        out.append(TestResult(cmd, NAMES.get(cmd, "Command"), parsed, status, final))
+        passed, why = _apply_override(NAMES.get(cmd, "Command"), parsed.value, default_pass, limits)
+        out.append(TestResult(cmd, NAMES.get(cmd, "Command"), parsed, status, passed, why))
     return out
 
 
@@ -286,7 +315,7 @@ if __name__ == "__main__":
     }
 
     limits = {
-        "Battery voltage": {"min": 4900, "max": 5100},          # one rule
+        "System Voltage": {"min": 4900, "max": 5100},          # one rule
         "Modem temperature": {"max": 30},                      # one rule
         "Network monitor":      [                            # multiple rules -> AND
             {"field": "rsrp_dbm", "min": -105},
