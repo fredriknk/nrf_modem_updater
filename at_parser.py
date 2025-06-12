@@ -29,7 +29,8 @@ GREEN, RED, RESET = "\033[92m", "\033[91m", "\033[0m"
 
 def _color(txt: str, ok: bool, hilite: bool) -> str:
     return f"{GREEN if ok else RED}{txt}{RESET}" if hilite else txt
-
+def _color_desc(desc: str, passed: bool, highlight: bool) -> str:
+    return _color(desc, passed, highlight) if not passed else desc
 
 # ────────────────────────── data containers ──────────────────────
 @dataclass
@@ -47,36 +48,58 @@ class TestResult:
     passed: bool
 
     def line(self, highlight: bool = True) -> str:
-        tag = _color("PASS" if self.passed else "FAIL", self.passed, highlight)
-        desc = self.parsed.description if self.parsed else "(no details)"
+        tag   = _color("PASS" if self.passed else "FAIL", self.passed, highlight)
+        desc  = self.parsed.description if self.parsed else "(no details)"
+        desc  = _color_desc(desc, self.passed, highlight)
         return f"{tag:5}  {self.name:<25}  {desc}"
+    # 1. helper: paint only if this field failed
+    def _maybe_red(text: str, failed: bool, highlight: bool) -> str:
+        return _color(text, False, highlight) if failed and highlight else text
+
+    # 2. helper: did a rule for this field fail?
+    def _field_failed(field: str, fail_set: set[str]) -> bool:
+        return field in fail_set
 
 
 # ────────────────────────── limit overrides ──────────────────────
 def _apply_override(
-    name: str, val: Any, default_pass: bool, limits: Dict[str, dict] | None
+    name: str,
+    val: Any,
+    default_pass: bool,
+    limits: Dict[str, dict | list[dict]] | None,
 ) -> bool:
+    """
+    Combine default PASS/FAIL with user-supplied *limits*.
+
+    *limits[name]* may be a single rule-dict **or** a list of rule-dicts.
+    All rules must evaluate True for the test to pass (logical AND).
+    """
     if not limits or name not in limits:
         return default_pass
 
-    rule = limits[name]
+    rule_set = limits[name]
+    if not isinstance(rule_set, list):
+        rule_set = [rule_set]  # unify
 
-    if isinstance(val, dict) and "field" in rule:
-        val = val.get(rule["field"])
+    def one_rule(rule: dict, v: Any) -> bool:
+        # pick sub-field first
+        if isinstance(v, dict) and "field" in rule:
+            v = v.get(rule["field"])
+        if v is None:
+            return False
+        if "equals" in rule:
+            return v == rule["equals"]
+        if "allowed" in rule:
+            return v in rule["allowed"]
+        lo = rule.get("min", float("-inf"))
+        hi = rule.get("max", float("inf"))
+        try:
+            return lo <= v <= hi  # type: ignore[operator]
+        except TypeError:
+            return False
 
-    if val is None:
-        return False
-    if "equals" in rule:
-        return val == rule["equals"]
-    if "allowed" in rule:
-        return val in rule["allowed"]
+    return all(one_rule(r, val) for r in rule_set)
 
-    lo = rule.get("min", float("-inf"))
-    hi = rule.get("max", float("inf"))
-    try:
-        return lo <= val <= hi  # type: ignore[operator]
-    except TypeError:
-        return False
 
 
 # ────────────────────────── individual parsers ───────────────────
@@ -157,8 +180,7 @@ def _parse_xmonitor(reply: str, _s: str | None) -> Tuple[Parsed, bool]:
     to_int = lambda x: int(x) if x.isdigit() else None
     reg_i, band_i = to_int(reg) or -1, to_int(band)
     rsrp_dbm = (to_int(rsrp_i) - 140) if to_int(rsrp_i) is not None else None
-    snr_db = (to_int(snr_i) / 10.0) if to_int(snr_i) is not None else None
-
+    snr_db = (to_int(snr_i) - 24 ) if to_int(snr_i) is not None else None
     status = {
         0: "not registered",
         1: "registered – home",
@@ -256,7 +278,7 @@ if __name__ == "__main__":
         "AT+CGMR": {"reply": "nRF9160 SICA 1.3.7", "status": "OK"},
         "AT+CEREG?": {"reply": "+CEREG: 0,1,\"81AE\",\"0331C805\",7", "status": "OK"},
         "AT%XMONITOR": {
-            "reply": "%XMONITOR: 1,\"\",\"\",\"24201\",\"81AE\",7,20,\"0331C805\",281,6400,53,42,\"\",\"\",\"\",\"\"",
+            "reply": "%XMONITOR: 1,\"\",\"\",\"24201\",\"81AE\",7,20,\"0331C805\",281,6400,30,42,\"\",\"00100001\",\"00000110\",\"01011111\"",
             "status": "OK",
         },
         "AT%XVBAT": {"reply": "%XVBAT: 5046", "status": "OK"},
@@ -264,12 +286,16 @@ if __name__ == "__main__":
     }
 
     limits = {
-    "Battery voltage": {"min": 4900, "max": 5100},      # mV
-    "Modem temperature": {"max": 30},                   # °C
-    "Network monitor": {"field": "rsrp_dbm", "min": -80},
-    #"Network monitor": {"field": "snr_db", "min": 4},  # dBm, dB
-    "Network registration": {"equals": 1},  # registered – home
-    "Manufacturer": {"equals": "Nordic Semiconductor ASA"},
-    "Firmware version": {"equals": "nRF9160 SICA 1.3.7"},
+        "Battery voltage": {"min": 4900, "max": 5100},          # one rule
+        "Modem temperature": {"max": 30},                      # one rule
+        "Network monitor":      [                            # multiple rules -> AND
+            {"field": "rsrp_dbm", "min": -105},
+            {"field": "snr_db", "min": 10},
+            {"field": "reg_status", "equals": 1},
+        ],
+        "Network registration": {"equals": 1},
+        "Manufacturer": {"equals": "Nordic Semiconductor ASA"},
+        "Firmware version": {"equals": "nRF9160 SICA 1.3.7"},
     }
+
     print(generate_report(demo,limits=limits, highlight=True))
