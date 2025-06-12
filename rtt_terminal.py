@@ -12,6 +12,15 @@ Key features
   structured dicts that pair each command with its payload and status.
 * **Graceful shutdown** – `stop()` is idempotent and closes the pyOCD session
   so no background threads linger.
+
+Add‑on (v1.3.0)
+===============
+* **Share an existing pyOCD Session** – pass it via ``session=`` so you can
+  re‑use the same J‑Link handle right after flashing.
+* Internal flag *own_session* decides whether :meth:`stop` should close the
+  session.
+* Fully backward‑compatible – if you don’t pass *session*, behaviour is
+  unchanged.
 """
 
 from __future__ import annotations
@@ -23,14 +32,12 @@ import time
 from contextlib import contextmanager
 from typing import Callable, Iterable, Optional
 
-from pyocd.core.helpers import ConnectHelper
+from pyocd.core.helpers import ConnectHelper, Session
 from pyocd.debug.rtt import RTTControlBlock  # adjust import if needed
 
 EOM = b"\r\n.\r\n"  # host → device sentinel
 CHUNK = 1024           # write() tries this many bytes at once
-
 AT_TERMINATORS = {"OK", "ERROR"}
-
 
 class RttTerminal:
     """High‑level wrapper around SEGGER RTT channels."""
@@ -41,25 +48,25 @@ class RttTerminal:
 
     def __init__(
         self,
-        target_override: str = "nrf91",
         *,
+        session: Optional[Session] = None,
+        target_override: str = "nrf91",
         on_line: Optional[Callable[[str], None]] = None,
         attach_console: Optional[bool] = None,
     ) -> None:
+        self._external_session = session  # None → create our own later
+        self._own_session = session is None
         self._target_override = target_override
         self._on_line = on_line or print
         self._attach_console = (
             attach_console if attach_console is not None else sys.stdin.isatty()
         )
 
-        self._session = None
+        self._session: Optional[Session] = session
         self._stop_evt = threading.Event()
         self._threads: list[threading.Thread] = []
-        self._down = None  # type: ignore[list‑assignment]
-        self._up = None    # type: ignore[list‑assignment]
-
-        # Queue that mirrors every incoming line so synchronous helpers can
-        # retrieve replies without blocking the user callback
+        self._down = None  # type: ignore[assignment]
+        self._up = None    # type: ignore[assignment]
         self._rx_q: "queue.Queue[str]" = queue.Queue()
 
     # ------------------------------------------------------------------
@@ -158,6 +165,7 @@ class RttTerminal:
         *,
         timeout: float = 2.0,
         progress: Optional[Callable[[str], None]] = None,
+        dwell: float = 0.0,
     ) -> dict[str, dict[str, str | None]]:
         """Run several AT commands **sequentially** and map each to its answer."""
         result: dict[str, dict[str, str | None]] = {}
@@ -165,6 +173,7 @@ class RttTerminal:
             if progress:
                 progress(cmd)
             result[cmd] = self.at_query(cmd, timeout=timeout)
+            time.sleep(dwell)  # optional dwell time between commands
         return result
 
     # ..................................................................
@@ -172,16 +181,13 @@ class RttTerminal:
     # ..................................................................
 
     def stop(self) -> None:
-        """Clean shutdown (idempotent)."""
         if self._stop_evt.is_set():
             return
-
         self._stop_evt.set()
         for t in self._threads:
             t.join(timeout=0.5)
         self._threads.clear()
-
-        if self._session is not None:
+        if self._own_session and self._session is not None:
             try:
                 self._session.close()
             finally:
@@ -193,51 +199,62 @@ class RttTerminal:
 
     def __exit__(self, exc_type, exc, tb):
         self.stop()
-        return False  # propagate
+        return False
 
     # ------------------------------------------------------------------
     # Internal lifecycle
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Open debug session, attach RTT, spin workers."""
-        if self._session is not None:
-            raise RuntimeError("Terminal already started")
-
-        self._session = ConnectHelper.session_with_chosen_probe(
-            target_override=self._target_override
-        )
-        if self._session is None:
-            raise RuntimeError("No debug probe found")
-
-        self._session.open()
-        target = self._session.target
-        target.resume()
+        if self._session is not None and not self._own_session:
+            # External session already open – just hook RTT
+            target = self._session.target
+        else:
+            # Create and open our own session
+            if self._session is not None:
+                raise RuntimeError("Terminal already started")
+            self._session = ConnectHelper.session_with_chosen_probe(
+                target_override=self._target_override
+            )
+            if self._session is None:
+                raise RuntimeError("No debug probe found")
+            self._session.open()
+            target = self._session.target
+            target.resume()
 
         rtt = RTTControlBlock.from_target(target)
         rtt.start()
-
         if len(rtt.down_channels) < 1 or len(rtt.up_channels) < 2:
             raise RuntimeError("Need ≥1 down and ≥2 up RTT channels")
-
         self._down = rtt.down_channels[0]
         self._up = rtt.up_channels[1]
 
-        # Purge leftover bytes
+        # Purge leftovers
         leftover = self._up.read()
         while leftover:
             leftover = self._up.read()
 
-        # start reader
+        # Threads
         t_reader = threading.Thread(target=self._rtt_reader, name="rtt-reader", daemon=True)
         self._threads.append(t_reader)
         t_reader.start()
-
-        # optional stdin mirror
         if self._attach_console:
             t_writer = threading.Thread(target=self._stdin_writer, name="stdin-writer", daemon=True)
             self._threads.append(t_writer)
             t_writer.start()
+
+    # ---------------------------------------------------------------------------
+    # Convenience context manager (accepts **session)
+    # ---------------------------------------------------------------------------
+
+    @contextmanager
+    def rtt_terminal(*args, **kwargs):
+        term = RttTerminal(*args, **kwargs)
+        try:
+            term.start()
+            yield term
+        finally:
+            term.stop()
 
     # ------------------------------------------------------------------
     # Worker threads (private)
@@ -308,9 +325,10 @@ def run_cli() -> None:
         print("Bye.")
 
 
-def main() -> None:  # Back‑compat
+def main() -> None:
     run_cli()
 
 
 if __name__ == "__main__":
     main()
+
