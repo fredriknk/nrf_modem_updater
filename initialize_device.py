@@ -12,7 +12,8 @@ from pyocd.target.family.target_nRF91 import ModemUpdater
 from pyocd.flash.file_programmer import FileProgrammer
 from pyocd.target.family.target_nRF91 import ModemUpdater, exceptions
 from rtt_terminal import RttTerminal
-from at_parser import generate_report
+from at_parser import generate_report, register_parser, _parse_cmng_read_sha,_pass_if_ok
+from at_cmng_builder import issue_with_ca
 
 
 MODEM_ZIP   = Path("fw/mfw_nrf9160_1.3.7.zip")
@@ -67,7 +68,7 @@ def main():
             "AT+CFUN=0", # Set the modem to minimum functionality mode
         ]
         limits = {
-            "System Voltage": {"min": 3700, "max": 4500},          # one rule
+            "System Voltage": {"min": 4900, "max": 5100},          # one rule
             "Modem temperature": {"max": 30},                      # one rule
             "Network monitor":      [                            # multiple rules -> AND
                 {"field": "rsrp_dbm", "min": -95},
@@ -89,6 +90,55 @@ def main():
                                     progress=lambda c: print("→", c),dwell=2, timeout=2.0)
         term.stop()
         
+        txt, js = generate_report(result, limits, return_json=True, highlight=True)
+        print(txt)
+
+        session.target.reset_and_halt()
+        session.target.resume()
+
+        sec_tag      = 16842753
+        print("Issue certificates over RTT")
+        cmds, pems = issue_with_ca(
+            sec_tag      = sec_tag,
+            client_cn    = "msense",
+            ca_crt_path  = "certs/ca.crt",
+            ca_key_path  = "certs/ca.key",
+            days         = 3650,        # optional
+        )
+        
+        limits = {}
+
+        for i, cmnd in enumerate(cmds):
+            #Register the parser for the command
+            register_parser(
+                cmnd,
+                _pass_if_ok,  # No specific parser for this command
+                f"Write Cert sec tag {sec_tag} pos {i}",  # Use the command as the name
+            )
+            limits[cmnd] = {"equals": "OK"}
+        
+        sha_hashes = pems["sha"]
+        for i in [0,1,2]:
+            cmds.append( f"AT%CMNG=1,{sec_tag},{i}")  # read SHA cert
+            #Register the parser for the cert SHA
+            register_parser(                       
+                f"AT%CMNG=1,{sec_tag},{i}",
+                _parse_cmng_read_sha,
+                f"SHA cert {i}",
+            )
+            # Add the certs SHA to an equal limits
+            limits[f"SHA cert {i}"] = {"equals": sha_hashes[i]}
+
+        term = RttTerminal(session=session, attach_console=False)
+        print("Starting RTT terminal for issuing certificates... may take a few secs to start")
+        print("Deactivating modem to issue certificates")
+        term.start()              
+        term.send("AT+CFUN=0")  # Set the modem to lp mode +CFUN=0
+        time.sleep(3)
+        print("Issuing certificates over RTT")
+        result = term.batch_at_query(cmds, dwell=4, timeout=5.0)
+        term.stop()
+        # -------- 5. generate report from the result -----------------------
         txt, js = generate_report(result, limits, return_json=True, highlight=True)
         print(txt)
 
