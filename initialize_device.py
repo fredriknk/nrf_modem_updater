@@ -113,7 +113,7 @@ def main():
             register_parser(
                 cmnd,
                 _pass_if_ok,  # No specific parser for this command
-                f"Write Cert sec tag {sec_tag} pos {i}",  # Use the command as the name
+                f"Sectag {sec_tag} pos {i}",  # Use the command as the name
             )
             limits[cmnd] = {"equals": "OK"}
         
