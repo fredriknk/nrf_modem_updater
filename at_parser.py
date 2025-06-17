@@ -147,7 +147,7 @@ _INT_RE = _re.compile(r"[-+]?\d+")
 
 
 def _pass_if_ok(reply: str, status: str | None) -> Tuple[Parsed, bool]:
-    return Parsed(reply, reply or "(no reply)"), (status or "OK") == "OK"
+    return Parsed(reply, reply or "(no error)"), (status or "OK") == "OK"
 
 
 def _verbatim(label: str, strip_prefix=False):
@@ -191,6 +191,21 @@ def _parse_xtemp(r: str, _):
     t = int(m.group(1))
     return Parsed(t, f"{t} °C"), -40 <= t <= 85
 
+def _parse_cmng_read_sha(reply: str, status: str | None):
+    """
+    Expect a single line like
+        %CMNG: 16842753,2,"6878A7C5DBC8..."
+    followed by OK.
+
+    We pull out the 64-char SHA string and mark the test PASS if the
+    command itself returned OK *and* the line was parseable.
+    """
+    m = _re.search(r'%CMNG:.*?"([0-9A-F]{64})"', reply, _re.I)
+    if not m:
+        return Parsed(reply, "unparseable"), False
+
+    sha = m.group(1)
+    return Parsed(sha, sha), (status or "OK") == "OK"
 
 def _parse_xsystemmode(r: str, _):
     m = _re.search(r"%XSYSTEMMODE: (\d),(\d),(\d),(\d)", r)
@@ -364,7 +379,17 @@ if __name__ == "__main__":
         },
         "AT%XVBAT": {"reply": "%XVBAT: 5046", "status": "OK"},
         "AT%XTEMP?": {"reply": "%XTEMP: 25", "status": "OK"},
+        "AT%CMNG=1,16842753,0": {
+            "reply": "%CMNG: 16842753,0,\"38495C490BC20BF1D6BA2BC72130833FE813C756B04936F1130A1D4370083DB6\"",
+            "status": "OK",
+        },
     }
+
+    register_parser(                       
+                f"AT%CMNG=1,16842753,0",
+                _parse_cmng_read_sha,
+                f"SHA cert 0",
+            )
 
     limits = {
         "System Voltage": {"min": 4900, "max": 5100},          # one rule
@@ -377,6 +402,7 @@ if __name__ == "__main__":
         "Network registration": {"equals": 1},
         "Manufacturer": {"equals": "Nordic Semiconductor ASA"},
         "Firmware version": {"equals": "nRF9160 SICA 1.3.7"},
+        "SHA cert 0": {"equals": "38495C490BC20BF1D6BA2BC72130833FE813C756B04936F1130A1D4370083DB6"},
     }
 
     txt, js = generate_report(sample, limits, return_json=True, highlight=True)
