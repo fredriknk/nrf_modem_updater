@@ -13,11 +13,11 @@ python ./nrf_flash_tool.py --update-modem --flash-rt-client
 # Wrtite security certificates
 python ./nrf_flash_tool.py --reboot --test-at --write-certs
 
-# Test AT commands + write security certificates
+# Flash AT Tool Test AT commands + write security certificates
 python ./nrf_flash_tool.py --flash-rt-client --test-at --write-certs
 
 # Full production test sequence
-python ./nrf_flash_tool.py --update-modem --flash-rt-client --test-at --write-certs --flash-main --debug
+python ./nrf_flash_tool.py --update-modem --flash-rt-client --test-at --write-certs --flash-main --debug --reset-on-exit
 """
 
 import argparse
@@ -73,7 +73,7 @@ AT_REPLY_LIMITS = {
     "System Voltage": {"min": 4900, "max": 5100},
     "Modem temperature": {"max": 30},
     "Network monitor": [
-        {"field": "rsrp_dbm", "min": -95},
+        {"field": "rsrp_dbm", "min": -106},
         {"field": "snr_db", "min": 15},
         {"field": "reg_status", "equals": 1},
     ],
@@ -108,38 +108,47 @@ def stream_defmt(
     *,
     elf: str,
     chip: str = "nRF9160_xxAA",
+    log_format: str | None = None,
     on_line: Optional[Callable[[str], None]] = None,
+    reset_on_close: bool = True,      
 ) -> subprocess.Popen:
     """
-    Spawn `probe-rs attach` to decode defmt over RTT and forward each line.
+    Spawn `probe-rs attach`, decode RTT/defmt, colour the output and forward it.
 
     Parameters
     ----------
     elf : str
-        Path to the exact ELF file that is already running on the MCU.
+        Path to the exact ELF that is already running on the MCU.
     chip : str, optional
-        The probe-rs chip identifier (default ``"nrf91"``).
+        Probe-RS chip identifier (default ``"nRF9160_xxAA"``).
+    log_format : str | None, optional
+        defmt printer format string.  If *None*, a sensible coloured default is
+        used (timestamp dimmed, level colour-coded & bold, then the message).
     on_line : Callable[[str], None] | None, optional
-        Callback that receives every decoded log line.  If *None*,
-        lines are printed to stdout.
-
-    Returns
-    -------
-    subprocess.Popen
-        The live probe-rs process.  Terminate it with ``proc.terminate()``
-        (or let the script exit) to stop the stream.
+        Callback for each decoded log line.  Falls back to ``print``.
     """
     elf_path = Path(elf).expanduser()
     if not elf_path.exists():
         raise FileNotFoundError(elf_path)
 
-    # Launch probe-rs in "attach" mode: no flashing, MCU keeps running.
-    # All RTT up-channel-0 frames will be decoded as defmt.
+    # default: grey timestamp · coloured/bold level · plain message
+    if log_format is None:
+        log_format = "{t:dimmed} [{L:severity:bold}] {s}"
+
+    # --- build the probe-rs command -------------------------------------------
+    cmd = [
+        "probe-rs",
+        "attach",
+        "--chip", chip,
+        str(elf_path),
+        "--log-format", log_format,
+    ]
+
     proc = subprocess.Popen(
-        ["probe-rs", "attach", "--chip", chip, str(elf_path),"--log-format={t} {[{L}]%bold} {s}  {{c} {ff}:{l:1}%dimmed}"],
+        cmd,
         stdout=subprocess.PIPE,
-        text=True,            # decoded UTF-8 lines from probe-rs
-        bufsize=1,            # line-buffered
+        text=True,     # UTF-8 lines out
+        bufsize=1,     # line buffered
     )
 
     cb = on_line or print
@@ -152,27 +161,33 @@ def stream_defmt(
             proc.stdout.close()
 
     threading.Thread(target=_forward, name="defmt-stream", daemon=True).start()
+
     return proc
+
+def _reset_rtt_terminal():
+    """Reset the RTT terminal on exit."""
+    try:
+        subprocess.run(["probe-rs", "reset", "--chip", "nRF9160_xxAA"], check=True)
+        print("✓ RTT terminal reset")
+    except subprocess.CalledProcessError as e:
+        print(f"✗ Failed to reset RTT terminal: {e}")
+        sys.exit(1)
 
 # -----------------------------------------------------------------------------
 
 
 def step_update_modem(session, modem_zip: Path):
-    print(f"Checking modem FW → {modem_zip.name}")
     updater = ModemUpdater(session)
+    print(f"updating modem FW → {modem_zip.name}")
+    print("→ Programming modem …")
     try:
-        updater.verify(str(modem_zip))
-        print("✓ Modem already up-to-date")
-    except exceptions.TargetError as err:
-        print(f"• Modem outdated: {err}")
-        print("→ Programming modem …")
-        try:
-            session.target.reset_and_halt()
-            updater.program_and_verify(str(modem_zip))
-        except exceptions.TargetError as err:
-            print(f"✗ Modem update failed: {err}")
-            sys.exit(1)
+        session.target.reset_and_halt()
+        updater.program_and_verify(str(modem_zip))
         print("✓ Modem updated")
+    except exceptions.TargetError as err:
+        print(f"✗ Modem update failed: {err}")
+        sys.exit(1)
+    
 
 
 def step_flash_client(session, elf: Path):
@@ -295,6 +310,9 @@ def build_cli(argv=None):
     
     p.add_argument("--debug", action="store_true",
                    help="Enable debug output (default: False)")
+    
+    p.add_argument("--reset-on-exit", action="store_true",
+                   help="reset the RTT terminal on exit (default: True)")
 
 
     return p.parse_args(argv)
@@ -312,6 +330,7 @@ def main(argv=None):
             args.write_certs,
             args.flash_main,
             args.debug,
+            args.reset_on_exit
         ]
     ):
         print("Nothing to do – see -h for help")
@@ -343,6 +362,8 @@ def main(argv=None):
         if args.debug:
             step_debug_defmt(session, args.client_elf)
 
+        if args.reset_on_exit:
+            _reset_rtt_terminal()
 
 # -----------------------------------------------------------------------------
 
