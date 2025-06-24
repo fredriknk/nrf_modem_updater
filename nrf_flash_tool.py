@@ -10,11 +10,14 @@ python ./nrf_flash_tool.py --update-modem
 # Update modem + flash RTT client
 python ./nrf_flash_tool.py --update-modem --flash-rt-client
 
-# Wrtite security certificates
+# Test AT commands
 python ./nrf_flash_tool.py --reboot --test-at --write-certs
 
 # Flash AT Tool Test AT commands + write security certificates
 python ./nrf_flash_tool.py --flash-rt-client --test-at --write-certs
+
+# Flash main application
+python ./nrf_flash_tool.py --flash-main --debug --reset-on-exit
 
 # Full production test sequence
 python ./nrf_flash_tool.py --update-modem --flash-rt-client --test-at --write-certs --flash-main --debug --reset-on-exit
@@ -54,19 +57,19 @@ RTT_AT_CLIENT_ELF_DEFAULT = Path("fw/nrf_rtt_at_client_npm1300")
 APPLICATION_ELF_DEFAULT  = Path("fw/msense-firmware")
 
 AT_COMMANDS = [
-    "AT+CFUN=1",
-    "AT+CEREG?",
-    "AT+CGMI",
-    "AT+CGMR",
-    "AT+CGMM",
-    "AT+CGSN",
-    "AT+CIMI",
-    "AT%XICCID",
-    "AT%XMONITOR",
-    "AT%XVBAT",
-    "AT%XTEMP?",
-    "AT%XSYSTEMMODE?",
-    "AT+CFUN=0",
+    "AT+CFUN=1",      # Put the modem into **full-functionality** (radio on, GNSS ready) 
+    "AT+CEREG?",      # Read the current **EPS / LTE network-registration status** 
+    "AT+CGMI",        # Return the **manufacturer identification** string – typically “Nordic Semiconductor ASA”.
+    "AT+CGMR",        # Return the **cellular-modem firmware revision** (e.g. *mfw_nrf9160_2.5.0*). 
+    "AT+CGMM",        # Return the **model identification** (e.g. *nRF9160-SICA*). 
+    "AT+CGSN",        # Return the device **IMEI** (15-digit serial number). 
+    "AT+CIMI",        # Return the **IMSI** stored in the SIM/UICC. 
+    "AT%XICCID",      # Nordic-proprietary command – read the SIM’s **ICCID** (SIM card serial number)
+    "AT%XMONITOR",    # Read an extended snapshot of **modem & network parameters**:
+    "AT%XVBAT",       # Measure and return the **battery voltage** (in mV, 4 mV resolution). 
+    "AT%XTEMP?",      # Read the **internal SiP temperature** (-40 … +125 °C) 
+    "AT%XSYSTEMMODE?",# Read the bit-mapped **system-mode configuration** currently enabled (LTE-M, NB-IoT and/or GNSS). 
+    "AT+CFUN=0",      # Put the modem in **minimum-functionality / offline** state – radio off,
 ]
 
 AT_REPLY_LIMITS = {
@@ -230,6 +233,22 @@ def step_test_at(session):
     txt, _ = generate_report(result, AT_REPLY_LIMITS, return_json=True, highlight=True)
     print(txt)
 
+def print_imei(session):
+    """Print the IMEI of the connected nRF9160."""
+    print("→ Reading IMEI …")
+    term = RttTerminal(session=session, attach_console=False)
+    term.start()
+    #turn on the modem
+    term.send("AT+CFUN=1")
+    time.sleep(3)
+    imei = term.at_query("AT+CGSN", timeout=2.0)
+    imsi = term.at_query("AT+CIMI", timeout=2.0)
+    term.send("AT+CFUN=0")
+    term.stop()
+    
+    print(f"IMEI: {imei}")
+    print(f"IMSI: {imsi}")
+    
 
 def step_write_certs(session):
     sec_tag = 16842753
@@ -295,6 +314,9 @@ def build_cli(argv=None):
     
     p.add_argument("--rt-client-elf", type=Path, default=RTT_AT_CLIENT_ELF_DEFAULT,
                    metavar="ELF", help="Override RTT client ELF path")
+    
+    p.add_argument("--print-imei", action="store_true",
+                   help="Print the IMEI of the connected nRF9160")
 
     p.add_argument("--test-at", action="store_true",
                    help="Run automated AT command test suite")
@@ -326,6 +348,7 @@ def main(argv=None):
             args.reboot,
             args.update_modem,
             args.flash_rt_client,
+            args.print_imei,    
             args.test_at,
             args.write_certs,
             args.flash_main,
@@ -349,6 +372,9 @@ def main(argv=None):
 
         if args.flash_rt_client:
             step_flash_client(session, args.rt_client_elf)
+
+        if args.print_imei:
+            print_imei(session)
 
         if args.test_at:
             step_test_at(session)
