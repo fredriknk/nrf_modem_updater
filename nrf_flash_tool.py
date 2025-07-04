@@ -53,8 +53,8 @@ from at_cmng_builder import issue_with_ca
 
 # ---- default artefacts ------------------------------------------------------
 MODEM_ZIP_DEFAULT        = Path("fw/mfw_nrf9160_1.3.7.zip")
-RTT_AT_CLIENT_ELF_DEFAULT = Path("fw/nrf_rtt_at_client_npm1300")
-APPLICATION_ELF_DEFAULT  = Path("fw/msense-firmware")
+RTT_AT_CLIENT_ELF_DEFAULT = Path("fw/nrf_rtt_at_client")#_npm1300")
+APPLICATION_ELF_DEFAULT  = Path("fw/msense-firmware_rev_1_3_2_0.2.2.elf")
 
 AT_COMMANDS = [
     "AT+CFUN=1",      # Put the modem into **full-functionality** (radio on, GNSS ready) 

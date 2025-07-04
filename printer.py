@@ -1,67 +1,62 @@
-# brady.py – BMP41 quick‑print helper with **interactive Tk preview** (Windows‑only)
+# brady.py – tiny BMP41 helper with **preview** and sane size defaults (Windows‑only)
 # ---------------------------------------------------------------------------
-# • Generates a tiny 1‑bit label bitmap (default 384 × 128 px ≈ 32 × 11 mm).
-# • If *preview=True* it pops up a Tk window showing the label at 3× scale
-#   with a **Print** button that immediately spools to the BMP41.
-# • Otherwise (*preview=False*, default) it prints head‑less via *mspaint /pt*.
+# Generates a 384 × 128 px 1‑bit bitmap (≈ 25 mm × 8 mm at 300 dpi) and either
+# shows it for preview or prints it via *mspaint /pt* to the Brady BMP41.
 #
-# Install: `pip install pillow`
+# Dependencies: Pillow (pip install pillow)
 
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont
 
-try:
-    import tkinter as tk
-except ImportError:  # head‑less interpreter (CI), disable preview functionality
-    tk = None  # type: ignore
+# Reasonable defaults for a BMP41 19 mm tape @ 300 dpi
+inch = 25.4
+dpi = 30
+width  = 30 # mm
+height = 12.7 # mm
+_FONTSIZE = 8  # pt, default for BMP41
+_LABEL_W = int((width/inch)*dpi)   # pixels (~32 mm across the tape width)
+_LABEL_H = int((height/inch)*dpi)   # pixels (~11 mm of feed length)
+_DEF_FONT = "Consolas.ttf"
 
-# --- defaults ---------------------------------------------------------------
-_LABEL_W = 384   # pixels  (≈32 mm across 19 mm tape @ 300 dpi)
-_LABEL_H = 128   # pixels  (≈11 mm feed length)
-_FONT_PATH = "Consolas.ttf"  # falls back to PIL’s default if missing
-_SCALE = 3       # GUI preview magnification factor
 
-
-# --- helpers ----------------------------------------------------------------
-
-def _best_font(max_w: int, max_h: int, text: str) -> ImageFont.FreeTypeFont:
-    """Return the largest font that keeps *text* within *max_w*×*max_h*."""
+def _load_font(max_width: int, max_height: int, text: str, font_path: str = _DEF_FONT):
+    """Find the largest font size that lets *text* fit within *max_width*."""
+    # Try big → small until it fits
     for size in range(72, 4, -2):
         try:
-            f = ImageFont.truetype(_FONT_PATH, size)
+            font = ImageFont.truetype(font_path, size)
         except OSError:
-            f = ImageFont.load_default()
-            return f
-        w, h = f.getbbox(text)[2:]
-        if w <= max_w and h <= max_h:
-            return f
+            font = ImageFont.load_default()
+            break
+        w, h = font.getbbox(text)[2:]
+        if w <= max_width and h <= max_height:
+            return font
     return ImageFont.load_default()
 
 
-def _render(imei: str, imsi: str, w: int, h: int) -> Image.Image:
-    img = Image.new("1", (w, h), 1)  # 1‑bit white
-    d = ImageDraw.Draw(img)
+def _render_label(imei: str, imsi: str, w: int, h: int) -> Image.Image:
+    """Return a PIL Image with the two numbers centered one above the other."""
+    img = Image.new("1", (w, h), 1)  # white background, 1‑bit
+    draw = ImageDraw.Draw(img)
 
-    f1 = _best_font(w - 10, h // 2 - 5, imei)
-    f2 = _best_font(w - 10, h // 2 - 5, imsi)
+    # Pick two independent font sizes that fill half the height each
+    font1 = _load_font(w - 10, h // 2 , imei)
+    font2 = _load_font(w - 10, h // 2 , imsi)
 
-    w1, h1 = d.textbbox((0, 0), imei, font=f1)[2:]
-    w2, h2 = d.textbbox((0, 0), imsi, font=f2)[2:]
+    w1, h1 = draw.textbbox((0, 0), imei, font=font1)[2:]
+    w2, h2 = draw.textbbox((0, 0), imsi, font=font2)[2:]
 
-    d.text(((w - w1) // 2, (h // 4) - (h1 // 2)), imei, font=f1, fill=0)
-    d.text(((w - w2) // 2, (3 * h // 4) - (h2 // 2)), imsi, font=f2, fill=0)
+    y1 = (h // 4) - (h1 // 2)
+    y2 = (3 * h // 4) - (h2 // 2)
+
+    draw.text(((w - w1) // 2, y1), imei, font=font1, fill=0)
+    draw.text(((w - w2) // 2, y2), imsi, font=font2, fill=0)
     return img
 
-
-def _mspaint_print(path: Path, printer: str):
-    subprocess.run(["mspaint.exe", "/pt", str(path), printer], check=True)
-
-
-# --- public -----------------------------------------------------------------
 
 def print_label(
     imei: str,
@@ -72,53 +67,28 @@ def print_label(
     label_height: int = _LABEL_H,
     preview: bool = False,
 ):
-    """Render an IMEI / IMSI label and either *print* or *preview* it.
+    """Preview or print a simple IMEI/IMSI label on a BMP41.
 
-    Parameters
-    ----------
-    preview : bool
-        • **True**  → open a Tk window (3× zoom) with a **Print** button.
-        • **False** → send directly to *printer_name* via *mspaint /pt*.
+    Set *preview=True* to just open the image without printing.
     """
-
     imei = "".join(filter(str.isdigit, imei))
     imsi = "".join(filter(str.isdigit, imsi))
 
-    img = _render(imei, imsi, label_width, label_height)
+    img = _render_label(imei, imsi, label_width, label_height)
+
+    if preview:
+        img.show()  # opens with the default image viewer
+        return
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-        img.save(tmp.name, "PNG", dpi=(300, 300))  # embed DPI for host apps
-    png_path = Path(tmp.name)
-
+        img.save(tmp.name, "PNG")
     try:
-        if preview and tk:
-            _show_preview(img, png_path, printer_name)
-        else:
-            _mspaint_print(png_path, printer_name)
+        subprocess.run(["mspaint.exe", tmp.name, printer_name], check=True)
     finally:
-        png_path.unlink(missing_ok=True)
+        Path(tmp.name).unlink(missing_ok=True)
 
 
-# --- GUI preview ------------------------------------------------------------
-
-def _show_preview(img: Image.Image, png_path: Path, printer_name: str):
-    """Interactive 3× zoom preview with a *Print* button."""
-    root = tk.Tk()
-    root.title("Label preview – {}".format(printer_name))
-
-    big = img.resize((img.width * _SCALE, img.height * _SCALE), Image.NEAREST)
-    tk_img = ImageTk.PhotoImage(big.convert("RGB"))
-
-    tk.Label(root, image=tk_img).pack(padx=10, pady=10)
-
-    def _do_print():
-        root.destroy()
-        _mspaint_print(png_path, printer_name)
-
-    tk.Button(root, text="Print", command=_do_print, width=12).pack(pady=(0, 10))
-    root.mainloop()
-
-
-# --- CLI smoke test ---------------------------------------------------------
 if __name__ == "__main__":
+    # Smoke test
     print_label("490154203237518", "310260123456789", preview=True)
+    #print_label("490154203237518", "310260123456789")

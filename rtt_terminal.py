@@ -21,6 +21,18 @@ Add‑on (v1.3.0)
   session.
 * Fully backward‑compatible – if you don’t pass *session*, behaviour is
   unchanged.
+
+Useful commands:
+AT+CFUN=1               # Start the modem
+AT+CGMI                 # Get manufacturer ID
+AT+CGMM                 # Get model ID
+AT+CGMR                 # Get firmware version
+AT+CGSN                 # Get serial number
+AT%SHORTSWVER           # Get short software version
+AT%XMONITOR             # Connection params <reg_status>,[<full_name>,<short_name>,<plmn>,<tac>,<AcT>,<band>,<cell_id>,<phys_cell_id>,<EARFCN>,<rsrp>,<snr>,<NW-provided_eDRX_value>,<Active-Time>,<Periodic-TAU-ext>]
+AT%NBRGRSRP             # Get neighbor cell RSRP
+AT%NCELLMEAS            # Get neighbor cell measurements
+AT%NCELLMEASSTOP        # Get neighbor cell info
 """
 
 from __future__ import annotations
