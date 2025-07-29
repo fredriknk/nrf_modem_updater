@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
 """
-nrf_flash_tool.py – Swiss-army CLI for the nRF9160 workflow
+nrf_flash_tool.py – Swiss‑army CLI for the nRF9160 workflow
+==========================================================
+
+Command‑line parameters
+────────────────────────────────────────────────────────
+Flag / option                  | Purpose & notes
+------------------------------ | ---------------------------------------------------------------
+--reboot                       | Immediately reset the connected target MCU before doing anything else.
+--update-modem                 | Flash the modem firmware contained in *--modem‑zip* (defaults to 1.3.7).
+--modem-zip ZIP                | Path to a custom modem‑firmware ZIP to use with *--update‑modem*.
+--flash-rt-client              | Flash the RTT AT‑command client ELF specified by *--rt-client-elf*.
+--rt-client-elf ELF            | Override path to the RTT AT‑client ELF.
+--print-imei                   | Query and print the device’s IMEI + IMSI (uses RTT AT commands).
+--test-at                      | Run the built‑in automated AT‑command test‑suite (network, voltage, etc.).
+--write-certs                  | Generate a key‑pair + client/CA certs and write them into the modem (CMNG).
+--flash-main                   | Flash the main application ELF indicated by *--client-elf*.
+--client-elf ELF               | Override path to the application ELF used with *--flash-main*.
+--debug                        | Open an RTT defmt log stream after flashing (*probe‑rs attach*).
+--reset-on-exit                | After all steps finish, issue a hardware reset so RTT detaches cleanly.
 
 Typical invocations
 ────────────────────────────────────────────────────────
-# Just update the modem
+# Just update the modem firmware
 python ./nrf_flash_tool.py --update-modem
 
 # Update modem + flash RTT client
@@ -13,13 +31,13 @@ python ./nrf_flash_tool.py --update-modem --flash-rt-client
 # Test AT commands
 python ./nrf_flash_tool.py --reboot --test-at --write-certs
 
-# Flash AT Tool Test AT commands + write security certificates
+# Flash RTT client, test AT commands and write security certificates
 python ./nrf_flash_tool.py --flash-rt-client --test-at --write-certs
 
-# Flash main application
+# Flash main application and tail defmt logs
 python ./nrf_flash_tool.py --flash-main --debug --reset-on-exit
 
-# Full production test sequence
+# Full production‑test sequence
 python ./nrf_flash_tool.py --update-modem --flash-rt-client --test-at --write-certs --flash-main --debug --reset-on-exit
 """
 
@@ -53,7 +71,7 @@ from at_cmng_builder import issue_with_ca
 
 # ---- default artefacts ------------------------------------------------------
 MODEM_ZIP_DEFAULT        = Path("fw/mfw_nrf9160_1.3.7.zip")
-RTT_AT_CLIENT_ELF_DEFAULT = Path("fw/nrf_rtt_at_client")#_npm1300")
+RTT_AT_CLIENT_ELF_DEFAULT = Path("fw/nrf_rtt_at_client_npm1300")
 APPLICATION_ELF_DEFAULT  = Path("fw/msense-firmware_rev_1_3_2_0.2.2.elf")
 
 AT_COMMANDS = [
