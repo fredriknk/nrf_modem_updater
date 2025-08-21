@@ -1,27 +1,15 @@
 # nRF9160 Flashing, RTT & AT Toolkit
 
-A small, batteries‑included toolkit for day‑to‑day nRF9160 work:
+A small, batteries‑included toolkit for provisioning NRF9160 devices via RTT so the main usecase is the nrf_flash_tool.py which can update your modem firmware. flash firmware binaries and run automated tests for the nrf9160 through the RTT.
 
 - **`nrf_flash_tool.py`** – one CLI to flash modem/app, run RTT defmt, batch AT tests, and provision TLS certs into the modem.
 - **`rtt_terminal.py`** – reusable RTT terminal with a clean blocking `query()` API and AT helpers you can script.
 - **`at_parser.py`** – parse Nordic‑style AT replies, apply limits, colorize PASS/FAIL, and export to CSV/JSON.
-- **`at_cmng_builder.py`** – build exact `%CMNG` write lines from existing PEMs (+ SHA‑256 digests that match `%CMNG=1`).  
-  Also includes an optional helper to sign a client cert from an existing CA.
+- **`at_cmng_builder.py`** – build exact `%CMNG` write lines from existing PEMs (+ SHA‑256 digests that match `%CMNG=1`).
+- **`create_ca.py`** – generate self-signed CA and server certificates.
 
-> The modules are library‑first; the CLI lives in `nrf_flash_tool.py`. Keep the pieces or import them into your own tools.
 
----
-
-## Contents
-
-```
-at_cmng_builder.py   # Build %CMNG write commands; compute matching SHA-256; (optional) sign client certs with an existing CA
-at_parser.py         # Registry-based AT reply parser with limits, colored text output, JSON + CSV helpers
-rtt_terminal.py      # Interactive + scriptable RTT terminal with query/at_query/batch_at_query
-nrf_flash_tool.py    # Swiss-army CLI that ties everything together
-```
-
-(Optional) you likely also have a small **certificate generator** script (e.g. `make_certs.py`) that replicates your old bash `openssl` flow in Python. It reads optional `.env` values and writes CA/server key+certs into `certs/`.
+ The modules are library‑first; the CLI lives in `nrf_flash_tool.py`. Keep the pieces or import them into your own tools.
 
 ---
 
@@ -48,7 +36,7 @@ python -m pip install --upgrade pyocd cryptography python-dotenv
 2. (Optional) Put modem firmware ZIP + ELFs where the defaults expect them:  
    - `fw/mfw_nrf9160_1.3.7.zip` (modem)  
    - `fw/nrf_rtt_at_client_npm1300` (RTT AT client ELF)  
-   - `fw/msense-firmware_*.elf` (app ELF)
+   - `fw/firmware.elf` (app ELF)
 3. Run one of the built‑ins:
 
 ```bash
