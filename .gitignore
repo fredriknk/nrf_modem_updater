@@ -19,3 +19,4 @@ fw/*
 !fw/.gitkeep
 !fw/nrf_rtt_at_client
 !fw/mfw_nrf9160_1.3.7.zip
+!fw/README.md
