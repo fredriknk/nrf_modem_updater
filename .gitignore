@@ -8,6 +8,10 @@ __pycache__/
 
 # Ignore everything in certs and fw folders
 certs/*
+*.crt
+*.key
+*.srl
+*.crt
 fw/*
 
 # But keep .gitkeep files
