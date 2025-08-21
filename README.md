@@ -1,6 +1,6 @@
 # nRF9160 Flashing, RTT & AT Toolkit
 
-A small, batteries‑included toolkit for provisioning NRF9160 devices via RTT so the main usecase is the nrf_flash_tool.py which can update your modem firmware. flash firmware binaries and run automated tests for the nrf9160 through the RTT.
+A small, batteries‑included toolkit for provisioning NRF9160 devices via RTT so the main usecase is the nrf_flash_tool.py which can update your modem firmware, provision certificates, flash firmware binaries and run automated tests for the nrf9160 through the RTT.
 
 - **`nrf_flash_tool.py`** – one CLI to flash modem/app, run RTT defmt, batch AT tests, and provision TLS certs into the modem.
 - **`rtt_terminal.py`** – reusable RTT terminal with a clean blocking `query()` API and AT helpers you can script.
@@ -70,7 +70,7 @@ High‑level tasks you can mix & match:
 --flash-main               Flash your main application ELF.
 --client-elf ELF           Override the app ELF path.
 --debug                    Open a color defmt stream (probe-rs attach) after flashing.
---reset-on-exit            Hardware reset when done (useful to cleanly detach RTT).
+--reset-on-exit            Hardware reset when done (useful to cleanly detach RTT after debug sessions).
 ```
 
 Defaults & paths live near the top of the file – adjust to your project layout.
@@ -198,9 +198,9 @@ The results print as a colored PASS/FAIL list and are also available as JSON for
 
 ---
 
-## Certificate generator (Python replica of your bash flow)
+## Certificate generator 
 
-If you include the small helper script (e.g. `make_certs.py`), it:
+If you run the small helper script (e.g. `create_ca.py`), it:
 
 - Creates a self‑signed **CA** (EC **prime256v1**) and a **server** key+CSR, then signs the server cert.
 - Respects an optional `.env`:
@@ -230,4 +230,4 @@ You can use the resulting `certs/ca.crt` + `ca.key` with `issue_with_ca()` to pr
 
 ## License
 
-Choose your own; the code is structured to be free of external data. MIT is a common choice.
+MIT
