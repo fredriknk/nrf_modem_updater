@@ -1,0 +1,3 @@
+Keep modem firmware and and firmware ELF files in `fw/`. Ive included the nrf_rtt_at_client ELF and the mfw_nrf9160_1.3.7.zip modem firmware by default for my own use, you can allso find updated modem files at [nordicsemi.com](https://www.nordicsemi.com/Products/nRF9160/Download#infotabs)
+
+The nrf_rtt_at_client ELF is a lightweight RTT client for testing AT commands over RTT. It is designed to work with the nRF9160 and can be flashed onto the device using the provided tools and its the main tool for interacting with the modem with this library. You can find the source in my repo [at github](https://github.com/fredriknk/rust_nrf_at_client/tree/main)
